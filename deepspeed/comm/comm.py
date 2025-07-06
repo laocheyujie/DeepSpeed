@@ -640,6 +640,7 @@ def enable_symm_mem_for_group(group_name: str):
 
 
 # Main DeepSpeed Comms. public API.
+# NOTE: KEY 通信后端初始化
 def init_distributed(dist_backend=None,
                      auto_mpi_discovery=True,
                      distributed_port=TORCH_DISTRIBUTED_DEFAULT_PORT,
@@ -663,28 +664,36 @@ def init_distributed(dist_backend=None,
         rank: Optional (int). The current manually specified rank. Some init_method like “tcp://” need the rank and world_size as well (see: https://pytorch.org/docs/stable/distributed.html#tcp-initialization)
         world_size: Optional (int). Desired world_size for the TCP or Shared file-system initialization.
     '''
+    # NOTE: 1. Communication Data Backend, cdb. 跟踪和管理分布式通信后端的状态
     global cdb
 
     configure(deepspeed_config=config)
 
+    # NOTE: 2. 检查 cdb 状态，如果为空或者未被初始化，则告诉后续程序需要初始化通信后端 dist_init_required is true
     if dist_init_required is None:
         dist_init_required = cdb is None or not cdb.is_initialized()
 
+    # NOTE: 3. 如果 cdb 为空，设置通信后端 NCCL/gloo/MPI 等
     if cdb is None:
+        # NOTE: communication_backend_name 得到通讯后端的名称，如 nccl/gloo/mpi 等
         init_deepspeed_backend(get_accelerator().communication_backend_name(), timeout, init_method)
         set_backend()
         utils.logger.info(f'cdb={cdb}')
+    # NOTE: 4. 如果 cdb 为空，但 torch 的分布式后端已被初始化，则设置 DeepSpeed 通信后端为 torch 通信后端，完成通信后端初始化，函数退出
     if cdb is None and torch.distributed.is_initialized():
         # The user initialized torch.dist themselves, create cdb and short-circuit
         cdb = TorchBackend(dist_backend, timeout, init_method)
         return
 
+    # NOTE: 5. 如果不需要初始化通信后端 dist_init_required is False，函数完成退出
     if dist_init_required is False:
         assert (
             cdb is not None and cdb.is_initialized() is True
         ), "Distributed backend is not initialized. Please set dist_init_required to True or initialize before calling deepspeed.initialize()"
+    # NOTE: 6. 如果需要初始化通信后端 dist_init_required is True
     else:
         # Initialize torch distributed if needed
+        # NOTE: 6.1 如果开启 MPI 自动发现并且环境变量都没有，根据不同运行环境 (Azure微软云/AWS亚马逊云/其它环境) 设置环境变量，以支持 PyTorch 分布式训练时使用 NCCL 后端
         required_env = ["RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"]
         if auto_mpi_discovery and not all(map(lambda v: v in os.environ, required_env)):
             if verbose:
@@ -696,16 +705,20 @@ def init_distributed(dist_backend=None,
             else:
                 mpi_discovery(distributed_port=distributed_port, verbose=verbose)
 
+        # NOTE: 6.2 如果检查通信后端已被初始化，通信后端初始化完成，函数完成退出
         if cdb is not None and cdb.is_initialized():
             if int(os.getenv('RANK', '0')) == 0:
                 utils.logger.info('Distributed backend already initialized')
+        # NOTE: 6.3 如果检查通信后端未被初始化，初始化 torch 通信后端，并赋值给 cdb，函数完成退出
         else:
             assert isinstance(timeout, timedelta)
             if dist_backend is None:
+                # NOTE: nccl / gloo / mpi 等
                 dist_backend = get_accelerator().communication_backend_name()
             if int(os.getenv('RANK', '0')) == 0:
                 utils.logger.info('Initializing TorchBackend in DeepSpeed with backend {}'.format(dist_backend))
             # Create a torch backend object, initialize torch distributed, and assign to cdb
+            # NOTE: 注意，本函数中调用两次 TorchBackend() 输入并不相同，一个是 torch 分布式后端已经初始化赋值即可（对应步骤4），这里是 torch 分布式后端没有初始化需要环境变量初始化
             cdb = TorchBackend(dist_backend, timeout, init_method, rank, world_size)
 
 
