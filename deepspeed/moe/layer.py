@@ -60,6 +60,7 @@ class MoE(nn.Module):
         self.ep_size = ep_size
         self.expert_group_name = f"ep_size_{self.ep_size}"
         self.num_experts = num_experts
+        # NOTE: 单块 gpu 上需要存放的 expert 数量
         self.num_local_experts = num_experts // self.ep_size
 
         log_dist(
@@ -69,7 +70,9 @@ class MoE(nn.Module):
         assert noisy_gate_policy is None or noisy_gate_policy in ['None', 'Jitter', 'RSample'], \
             'Unsupported noisy_gate_policy: ' + noisy_gate_policy
 
+        # NOTE: 定义一个 MoE 层上所有的 expert
         experts = Experts(expert, self.num_local_experts, self.expert_group_name)
+        # NOTE: 定义 MoE 层 
         self.deepspeed_moe = MOELayer(TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
                                                min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
                                                top2_2nd_expert_sampling),
@@ -84,22 +87,31 @@ class MoE(nn.Module):
             self.coefficient = nn.Linear(hidden_size, 2)
 
     def set_deepspeed_parallelism(self, use_data_before_expert_parallel_: bool = False) -> None:
+        # NOTE: ep 相关分布式设置
+        # 如果检测到一个 module 拥有 set_deepspeed_parallelism 属性，则对它执行相关的分布式设置操作
         self._create_process_groups(use_data_before_expert_parallel_=use_data_before_expert_parallel_)
 
     def _create_process_groups(self, use_data_before_expert_parallel_: bool = False) -> None:
+        # NOTE: ep 相关分布式设置
         # Create process group for a layer if needed
+        # NOTE: 如果当前还未做 ep 相关分布式设置，那么就先做设置
         if self.expert_group_name not in groups._get_expert_parallel_group_dict():
             print(f"No existing process group found, creating a new group named: {self.expert_group_name}")
+            # NOTE: 1. 当没使用 Megatron 分布式并行，或者使用了 Megatron 但又不想对 expert 组 tp 切分，那么就按 EP + DP 的方式设置 ep 相关 group
             if (groups.mpu is None) or (not self.enable_expert_tensor_parallelism):
                 # Condition 1 - no groups.mpu means no tensor parallelism
                 # Condition 2 - disabling expert tensor parallelism on purpose
                 groups._create_expert_and_data_parallel(
                     self.ep_size, use_data_before_expert_parallel_=use_data_before_expert_parallel_)
+            # NOTE: 其余情况则使用 EP + DP + TP 方式
             else:
                 # expert tensor parallelism is enabled
                 groups._create_expert_data_and_model_parallel(
                     self.ep_size, mpu=groups.mpu, use_data_before_expert_parallel_=use_data_before_expert_parallel_)
         # Set the group handle for the MOELayer (deepspeed_moe) object
+        # NOTE: 在做完 ep 相关分布式设置的情况下，为当前进程所属的 MoE 层显示设置 ep_group
+        # 这样就可以在 ep_group 内做 all2all 通讯
+        # 如果不显示设置 ep_group，则默认是对所有 gpu 卡（world_size）做 all2all
         self.deepspeed_moe._set_ep_group(groups._get_expert_parallel_group(self.expert_group_name))
 
     def forward(self,

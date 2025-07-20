@@ -479,6 +479,7 @@ class TopKGate(Module):
                  top2_2nd_expert_sampling: bool = True) -> None:
         super().__init__()
 
+        # NOTE: 定义 Gate 层架构
         self.wg = torch.nn.Linear(model_dim, num_experts, bias=False)
         self.ep_group = ep_group
         self.k = k
@@ -557,11 +558,18 @@ class MOELayer(Base):
                  num_local_experts: int,
                  use_tutel: bool = False) -> None:
         super().__init__()
+        # NOTE: TopKGate 类，用来决定 token 的分法策略
         self.gate = gate
+        # NOTE: 当前进程所属的 gpu 上维护的所有 experts, nn.ModuleList[ParallelMLP()]
         self.experts = experts
+        # NOTE: 当前进程所属的 ep_group，为 None 时表示所有的 gpu 构成一个 ep_group
+        # 当执行 _set_ep_group 方法时，可以自定义 ep_group (参见 MoE 类下 _create_process_groups 方法)
         self.ep_group = None
+        # NOTE: 当前进程所属的 ep_group 的 ep_world_size
         self.ep_size = ep_size
+        # NOTE: 当前进程所属的 ep_group 的名称
         self.ep_group_name = ep_group_name
+        # NOTE: 当前进程所属的 gpu 上所维护的 experts 数量，它即为 self.experts 中维护的 experts 数量
         self.num_local_experts = num_local_experts
         self.time_falltoall = 0.0
         self.time_salltoall = 0.0
@@ -569,6 +577,7 @@ class MOELayer(Base):
         self.timers = SynchronizedWallClockTimer()
         self.wall_clock_breakdown = False
 
+        # NOTE: 是否使用 tutel 做路由优化
         self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
 
         if self.use_tutel:
@@ -590,6 +599,12 @@ class MOELayer(Base):
             self.timers(MOE_TIMER).start()
 
         # Implement Algorithm 2 from GShard paper.
+        # NOTE: 1. 对 input 做 reshape
+        # 注意入参中 input 前面带 * 号，意味着传入的 input 是一个 tuple，一般是一个二元组
+        # input[0] 是真正要做计算的 batch 数据，其尺寸为 (seq_len, batch_size, M)
+        # input[1] 是掩码数据，其尺寸为 (seq_len * batch_size)
+        # 有时在计算 MoE 结果时，相对某些 token 做 mask，使其不参与计算，就可以把 mask 数据装在这里
+        # reshaped_input 尺寸为 (S, M)，其中 S = seq_len * batch_size
         d_model = input[0].shape[-1]
 
         # Initial implementation -> Reshape into S tokens by dropping sequence dimension.
@@ -605,14 +620,26 @@ class MOELayer(Base):
                 self._tutel_dispatcher = tutel_moe.fast_dispatcher(E, C, M, dispatch_dtype=reshaped_input.dtype)
             self._tutel_dispatcher.update(indices_, locations_, gates_, capacity=C)
             dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
+        # NOTE: 2. 使用自定义的 Gshard Gate，确定 token 的分法策略
+        # gate: TopKGate 类
+        # l_aux:: 辅助损失函数值
+        # combine_weights: 尺寸为 (S, E, C)，表示对每个 token (S) 而言，它对每个专家 (E) 的 weight
+        #                  而这个 weight 按照该 token 在 buffer 中的位置 (C) 存放，不是目标位置的地方则用 0 填充
+        # dispatch_mask：  它等于 combine_weights.bool()，也就是对 combine_weights 为 0 的地方设为 False，为 1 的地方设为 True
+        #                  dispatch_mask 后续将被用在 zero padding 上
         else:
+            # NOTE: 确认 token 分法策略
             self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            # NOTE: 3. 将输入数据按照 expert 的顺序排好，并做 zero padding, 为下一步送去 expert 计算做准备（很重要）
+            # dispatched_input: 尺寸为 (E, C, M)，表示每个 expert (E) 的 buffer (C) 下要处理的 token_embedding (M)
+            #                   当对应 expert 接收的 token 数不足 buffer 长度 C 时，不足的地方用 0 向量填充
             dispatched_input = einsum("sec,sm->ecm", dispatch_mask.type_as(input[0]), reshaped_input)
 
         if self.wall_clock_breakdown:
             self.timers(FIRST_ALLTOALL_TIMER).start()
 
         tensor_model_world_size = bwc_tensor_model_parallel_world_size(groups.mpu)
+        # NOTE: 4. 当 expert 不采用 tp 切分，而 non-MoE 部分采用 tp 切分时，为避免数据重复发送，需要对同一个 tp 组内的 tokens 做去重
         if tensor_model_world_size > 1:
             # If the non-expert is tensor-parallel,
             # Whether expert is tensor-parallel or not , it will create
@@ -626,6 +653,9 @@ class MOELayer(Base):
             # an allgather to ensure correctness,
             dispatched_input = drop_tokens(dispatched_input, dim=1)
 
+        # NOTE: 5. 第一次 All2All: 将 token 发给对应的 expert
+        # dispatched_input 尺寸为 (E, C, M)，又可以写成 (G * e, C, M)，其中 G = ep_world_size, e = num_local_experts
+        # 在将它正式喂给 expert 前，把它 reshape 成 (G, e, C, M)
         dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
 
         if self.wall_clock_breakdown:
@@ -640,6 +670,7 @@ class MOELayer(Base):
 
         # Re-shape after all-to-all: ecm -> gecm
         dispatched_input = dispatched_input.reshape(self.ep_size, self.num_local_experts, -1, d_model)
+        # NOTE: 6. 将 token 喂给 expert 计算，expert_outpu 尺寸为 (G, e, C, M)
         expert_output = self.experts(dispatched_input)
         # Re-shape before drop_tokens: gecm -> ecm
         expert_output = expert_output.reshape(self.ep_size * self.num_local_experts, -1, d_model)
@@ -652,23 +683,29 @@ class MOELayer(Base):
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).start()
 
+        # NOTE: 7. 第二次 All2All: 将算好的 token 返回给产出它的 gpu
+        # expert_output 为 (G, e, C, M)，即此时这张卡上维护的 token 过 MoE 的结果，是由它从 ep_group (G) 内所有 expert (e) 的结果汇总而来的
         expert_output = _AllToAll.apply(self.ep_group, expert_output)
 
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).stop()
             self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
 
+        # NOTE: 8. 如果之前在 tp 组内做过数据去重处理，这里要把数据 all-gather 回来
         if tensor_model_world_size > 1:
             # the dropped duplicate tokens need to be gathered on each
             # tensor parallel rank again for the tensor-parallel
             # non-expert of the next layer.
             expert_output = gather_tokens(expert_output, dim=1)
 
+        # NOTE: 9. 使用 combine_weights 进行加权计算
+        # combined_output 尺寸为 (S, M)，其中 S = seq_len * batch_size
         if self.use_tutel:
             combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
         else:
             combined_output = einsum("sec,ecm->sm", combine_weights.type_as(input[0]), expert_output)
 
+        # NOTE: 最终输出 a 尺寸为: (seq_len, batch_size, M)
         a = combined_output.reshape(input[0].shape)
 
         if self.wall_clock_breakdown:
